@@ -1,0 +1,37 @@
+# 重音判定忽略名单：地名拼音 / 非英语词 / ISE 拼读不准的词
+# 每行一个，小写。用户可手工增量添加。
+
+# 中国地名拼音
+beijing
+shanghai
+sanlitun
+huawei
+guangzhou
+shenzhen
+hangzhou
+chengdu
+xian
+nanjing
+suzhou
+tianjin
+
+# 中国常见姓氏
+zhang
+wang
+li
+liu
+chen
+yang
+huang
+zhao
+wu
+zhou
+
+# 公司/品牌拼音
+xiaomi
+tencent
+alibaba
+baidu
+bytedance
+didi
+meituan

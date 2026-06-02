@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+audio_cache/
+watch_jobs.sh
+.claude
+venv
+
+# 任务数据（含 Appen 签名音频 URL + 任务内容，勿公开）
+result/
+samples/
