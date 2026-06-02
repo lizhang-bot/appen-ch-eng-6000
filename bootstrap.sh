@@ -84,13 +84,18 @@ if [ -f .env ]; then
 else
     cp .env.example .env
     if [ -t 0 ]; then
-        echo "填入讯飞 ISE 凭据（直接回车则保留占位符，稍后手动改 .env）："
+        echo "填入凭据（直接回车则保留占位符，稍后手动改 .env）："
         read -rp "  XF_APPID: "      v_appid || true
         read -rp "  XF_API_SECRET: " v_secret || true
         read -rp "  XF_API_KEY: "    v_key || true
+        read -rp "  DINGTALK_WEBHOOK（可空）: " v_ding || true
         [ -n "${v_appid:-}" ]  && sed -i "s|^XF_APPID=.*|XF_APPID=${v_appid}|"          .env
         [ -n "${v_secret:-}" ] && sed -i "s|^XF_API_SECRET=.*|XF_API_SECRET=${v_secret}|" .env
         [ -n "${v_key:-}" ]    && sed -i "s|^XF_API_KEY=.*|XF_API_KEY=${v_key}|"        .env
+        if [ -n "${v_ding:-}" ]; then
+            ding_esc=$(printf '%s' "$v_ding" | sed 's/[&|]/\\&/g')   # 转义 & | 供 sed 安全替换
+            sed -i "s|^DINGTALK_WEBHOOK=.*|DINGTALK_WEBHOOK=${ding_esc}|" .env
+        fi
         echo "已写入 .env"
     else
         warn "非交互模式，.env 仍是占位符，请手动编辑填入讯飞凭据"
