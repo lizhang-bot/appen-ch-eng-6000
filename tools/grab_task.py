@@ -19,16 +19,22 @@ content 含关键字「报告」以过群机器人校验）——服务器无 GU
 
 依赖：playwright + python-dotenv（cookie 复用 watch_jobs.sh 里的 COOKIE 字段）
 
+多工作流：脚本内置 WORKFLOWS 列表（A3189/A3244/A3245…）。不传 --url 时默认轮询全部——
+每个工作流占一个常驻 tab，各 tab 错峰起跑，全局形成 A→B→C→A… 轮换：interval=0.2、
+3 个工作流时 0.2s 试 A、0.4s 试 B、0.6s 试 C、0.8s 回 A，每个工作流每 0.6s 试一次。
+execute 只认 body 里的 jobId/flowId，与页面 URL 无关。新增工作流：在 WORKFLOWS 里加一行。
+
 用法：
     source venv/bin/activate
-    python tools/grab_task.py \\
-        --url "https://collect-web.appen.com.cn/collect/qa?flowId=...&jobId=...&locale=zh-CN" \\
-        --tabs 2 --interval 0.2
+    python tools/grab_task.py                          # 轮询所有预置工作流（默认）
+    python tools/grab_task.py --only A3244,A3245        # 只轮询指定工作流
+    python tools/grab_task.py --url "https://.../qa?flowId=...&jobId=..."  # 临时单个
 
 参数：
-    --url       任务页完整 URL（含 jobId/flowId），从 Chrome 地址栏抄
-    --tabs      并行 tab 数，默认 2
-    --interval  目标全局尝试间隔秒，默认 0.2（每个 tab 实际周期 = interval×tabs，错峰发起）
+    --url       临时工作流 URL（含 jobId/flowId），可重复；不填则用内置 WORKFLOWS 全部
+    --only      只轮询指定预置工作流，逗号分隔 code（如 A3244,A3245）
+    --tabs      总 tab 数，默认 max(2, 工作流数)；多于工作流数时每工作流多开 tab
+    --interval  全局尝试间隔秒，默认 0.2（每隔此时长轮换到下一个工作流）
     --headless  无头模式（默认有头，方便抢到后直接在该窗口质检）
 """
 
@@ -55,6 +61,17 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 )
+
+# 预置工作流（领任务页 URL，含 jobId/flowId）。不传 --url 时默认轮询全部。
+# 新增工作流：复制一行、改 code/name/url 即可。
+WORKFLOWS = [
+    {"code": "A3189", "name": "中英信实",
+     "url": "https://collect-web.appen.com.cn/collect/qa?flowId=2058728701937496080&jobId=2059525664826957849&locale=zh-CN"},
+    {"code": "A3244", "name": "中英中哈",
+     "url": "https://collect-web.appen.com.cn/collect/qa?flowId=2061734459464458251&jobId=2061735070294781978&locale=zh-CN"},
+    {"code": "A3245", "name": "中英莓树",
+     "url": "https://collect-web.appen.com.cn/collect/qa?flowId=2061734682458824727&jobId=2061735186987458587&locale=zh-CN"},
+]
 
 # 在页面上下文里调领取接口，返回精简结果。page.evaluate 没有 Chrome MCP 的 BLOCK 限制。
 EXEC_JS = """
@@ -87,6 +104,17 @@ CODE_JS = r"""
   return m ? m[1] : null;
 }
 """
+
+
+def build_workflow(url: str, name: str = "", code: str = "") -> dict:
+    """从 URL 解析 jobId/flowId，组装工作流字典。"""
+    q = parse_qs(urlparse(url).query)
+    job_id = (q.get("jobId") or [None])[0]
+    flow_id = (q.get("flowId") or [None])[0]
+    if not job_id or not flow_id:
+        raise SystemExit(f"URL 缺 jobId 或 flowId：{url}")
+    return {"name": name or code or job_id, "code": code, "url": url,
+            "job_id": job_id, "flow_id": flow_id}
 
 
 def get_cookie_str() -> str:
@@ -180,18 +208,19 @@ class State:
         self.reason = None  # "claimed" / "auth"
 
 
-async def worker(idx: int, page, job_id: str, flow_id: str, interval: float,
-                 n_tabs: int, url: str, state: State, t0: float) -> None:
-    await asyncio.sleep(idx * interval)  # 错峰起跑
+async def worker(idx: int, page, wf: dict, interval: float,
+                 n_tabs: int, state: State, t0: float) -> None:
+    await asyncio.sleep(idx * interval)  # 错峰起跑：tab i 在 i*interval 首发，全局形成工作流轮换
     period = interval * n_tabs
+    label = f"{wf['code']} {wf['name']}".strip()
     while not state.done.is_set():
         start = time.time()
-        res = await page.evaluate(EXEC_JS, {"jobId": job_id, "flowId": flow_id})
+        res = await page.evaluate(EXEC_JS, {"jobId": wf["job_id"], "flowId": wf["flow_id"]})
         state.attempts += 1
         n = state.attempts
 
         if res.get("fetchErr"):
-            print(f"\n[tab{idx} #{n}] fetch 错误：{res['fetchErr']}（继续）")
+            print(f"\n[tab{idx} {label} #{n}] fetch 错误：{res['fetchErr']}（继续）")
         elif res.get("status") in (401, 403):
             async with state.lock:
                 if not state.handled:
@@ -210,16 +239,17 @@ async def worker(idx: int, page, job_id: str, flow_id: str, interval: float,
                     state.handled = True
                     state.reason = "claimed"
                     elapsed = time.time() - t0
-                    print(f"\n🎉 抢到任务！tab{idx} 第 {n} 次尝试，用时 {elapsed:.1f}s。刷新进入质检……")
-                    notify("Appen 抢到任务", "已领取，快去质检！", say_text="抢到任务了，快去质检")
-                    dingtalk(f"Appen 抢任务报告\n已抢到任务（tab{idx} 第 {n} 次尝试，"
-                             f"用时 {elapsed:.1f}s），请尽快进入质检。\n{url}")
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                    await print_next_steps(page, url)
+                    print(f"\n🎉 抢到任务！[{label}] tab{idx} 第 {n} 次尝试，用时 {elapsed:.1f}s。刷新进入质检……")
+                    notify("Appen 抢到任务", f"{label} 已领取，快去质检！",
+                           say_text="抢到任务了，快去质检")
+                    dingtalk(f"Appen 抢任务报告\n[{label}] 已抢到任务（第 {n} 次尝试，"
+                             f"用时 {elapsed:.1f}s），请尽快进入质检。\n{wf['url']}")
+                    await page.goto(wf["url"], wait_until="domcontentloaded", timeout=30000)
+                    await print_next_steps(page, wf["url"])
             state.done.set()
             break
         else:
-            sys.stdout.write(f"\r尝试 {n} 次… 暂无任务（{n_tabs} tab 并行）   ")
+            sys.stdout.write(f"\r尝试 {n} 次… 暂无任务（{n_tabs} tab 轮询）   ")
             sys.stdout.flush()
 
         elapsed = time.time() - start
@@ -227,15 +257,13 @@ async def worker(idx: int, page, job_id: str, flow_id: str, interval: float,
         await asyncio.sleep(sleep_s)
 
 
-async def grab(url: str, n_tabs: int, interval: float, headless: bool) -> None:
-    q = parse_qs(urlparse(url).query)
-    job_id = (q.get("jobId") or [None])[0]
-    flow_id = (q.get("flowId") or [None])[0]
-    if not job_id or not flow_id:
-        raise SystemExit("URL 里缺 jobId 或 flowId")
+async def grab(workflows: list[dict], n_tabs: int, interval: float, headless: bool) -> None:
+    # tab i 绑定 workflows[i % W]，各自只轮询自己工作流；按 i*interval 错峰，全局即轮换
+    assign = [workflows[i % len(workflows)] for i in range(n_tabs)]
 
     cookies = parse_cookies(get_cookie_str())
-    print(f"加载 {len(cookies)} 个 cookie；jobId={job_id} flowId={flow_id}")
+    print(f"加载 {len(cookies)} 个 cookie；轮询 {len(workflows)} 个工作流："
+          + "、".join(f"{w['code']}{w['name']}" for w in workflows))
 
     if not headless and sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
         headless = True
@@ -249,16 +277,20 @@ async def grab(url: str, n_tabs: int, interval: float, headless: bool) -> None:
         await ctx.add_cookies(cookies)
 
         pages = [await ctx.new_page() for _ in range(n_tabs)]
-        print(f"navigate {n_tabs} 个 tab → {url}")
+        labels = ", ".join(f"tab{i}={assign[i]['code']}" for i in range(n_tabs))
+        print(f"navigate {n_tabs} 个 tab：{labels}")
         await asyncio.gather(*(
-            pg.goto(url, wait_until="domcontentloaded", timeout=30000) for pg in pages
+            pages[i].goto(assign[i]["url"], wait_until="domcontentloaded", timeout=30000)
+            for i in range(n_tabs)
         ))
 
         state = State()
         t0 = time.time()
-        print(f"开始抢任务，{n_tabs} tab 错峰并行，目标 ~{interval}s/次。Ctrl+C 停止。")
+        per_wf = interval * len(workflows)
+        print(f"开始抢任务，{n_tabs} tab 错峰轮询，全局 ~{interval}s/次"
+              f"（每个工作流每 ~{per_wf:.1f}s 一次）。Ctrl+C 停止。")
         await asyncio.gather(*(
-            worker(i, pages[i], job_id, flow_id, interval, n_tabs, url, state, t0)
+            worker(i, pages[i], assign[i], interval, n_tabs, state, t0)
             for i in range(n_tabs)
         ))
 
@@ -271,14 +303,36 @@ async def grab(url: str, n_tabs: int, interval: float, headless: bool) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", required=True, help="任务页完整 URL（含 jobId/flowId）")
-    ap.add_argument("--tabs", type=int, default=2, help="并行 tab 数，默认 2")
+    ap.add_argument("--url", action="append",
+                    help="临时工作流 URL（含 jobId/flowId），可重复；不填则轮询所有预置工作流")
+    ap.add_argument("--only",
+                    help="只轮询指定预置工作流，逗号分隔 code（如 A3244,A3245）")
+    ap.add_argument("--tabs", type=int, default=0,
+                    help="总 tab 数，默认 max(2, 工作流数)；多于工作流数时每工作流多开 tab")
     ap.add_argument("--interval", type=float, default=0.2,
-                    help="目标全局尝试间隔秒，默认 0.2")
+                    help="全局尝试间隔秒，默认 0.2（每隔此时长轮换到下一个工作流）")
     ap.add_argument("--headless", action="store_true", default=False)
     args = ap.parse_args()
+
+    if args.url:
+        workflows = [build_workflow(u) for u in args.url]
+    else:
+        wfs = WORKFLOWS
+        if args.only:
+            want = {c.strip().upper() for c in args.only.split(",")}
+            wfs = [w for w in WORKFLOWS if w["code"].upper() in want]
+            if not wfs:
+                raise SystemExit(f"--only {args.only} 没匹配到任何预置工作流")
+        workflows = [build_workflow(w["url"], w["name"], w["code"]) for w in wfs]
+
+    n_tabs = args.tabs or max(2, len(workflows))
+    if n_tabs < len(workflows):
+        print(f"[warn] tabs={n_tabs} < 工作流数={len(workflows)}，会漏掉部分工作流，"
+              f"自动提升到 {len(workflows)}")
+        n_tabs = len(workflows)
+
     try:
-        asyncio.run(grab(args.url, args.tabs, args.interval, args.headless))
+        asyncio.run(grab(workflows, n_tabs, args.interval, args.headless))
     except KeyboardInterrupt:
         print("\n已停止。")
 
