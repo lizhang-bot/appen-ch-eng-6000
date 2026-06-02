@@ -32,10 +32,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 from qa_pipeline import (  # noqa: E402
-    RESULT_DIR,
     clean_text,
     detect_lang,
     load_result,
+    result_path,
     save_result,
 )
 
@@ -127,7 +127,8 @@ def parse_cookies(cookie_str: str) -> list[dict]:
     return out
 
 
-async def collect(code: str, url: str, total: int, interval_ms: int, headless: bool):
+async def collect(code: str, url: str, total: int, interval_ms: int, headless: bool,
+                  workflow: str = ""):
     cookies = parse_cookies(get_cookie_str())
     print(f"加载 {len(cookies)} 个 cookie: {[c['name'] for c in cookies]}")
 
@@ -223,10 +224,11 @@ async def collect(code: str, url: str, total: int, interval_ms: int, headless: b
 
     print(f"解码 {len(entries)} 题")
 
-    result_path = Path(RESULT_DIR) / f"{code}.json"
-    result_path.parent.mkdir(exist_ok=True)
-    doc = load_result(str(result_path))
+    rpath = result_path(code, workflow)
+    doc = load_result(rpath)
     doc.setdefault("code", code)
+    if workflow:
+        doc.setdefault("workflow", workflow)
     doc.setdefault("totalQuestions", total)
     doc.setdefault("questions", [])
     by_seq = {q["seq"]: q for q in doc["questions"]}
@@ -254,11 +256,11 @@ async def collect(code: str, url: str, total: int, interval_ms: int, headless: b
             new_count += 1
 
     doc["questions"].sort(key=lambda q: q["seq"])
-    save_result(str(result_path), doc)
+    save_result(rpath, doc)
 
     seqs = {q["seq"] for q in doc["questions"]}
     missing = sorted(set(range(1, total + 1)) - seqs)
-    print(f"\n写入 {result_path}: 新增 {new_count}, 更新 {updated_count}")
+    print(f"\n写入 {rpath}: 新增 {new_count}, 更新 {updated_count}")
     print(f"总 {len(doc['questions'])}/{total}")
     if missing:
         preview = missing[:30]
@@ -269,7 +271,9 @@ async def collect(code: str, url: str, total: int, interval_ms: int, headless: b
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("code", help="结果文件名（如 6 对应 result/6.json）")
+    ap.add_argument("code", help="页面编号（如 6）；结果存 result/[<workflow>/]<code>.json")
+    ap.add_argument("--workflow", default="",
+                    help="工作流 code（如 A3244）。指定后结果存 result/<workflow>/<code>.json")
     ap.add_argument("--url", required=True, help="质检页面完整 URL")
     ap.add_argument("--total", type=int, default=203)
     ap.add_argument("--interval", type=int, default=200, help="click 间隔毫秒，默认 200")
@@ -279,7 +283,7 @@ def main():
 
     asyncio.run(collect(
         code=args.code, url=args.url, total=args.total,
-        interval_ms=args.interval, headless=args.headless,
+        interval_ms=args.interval, headless=args.headless, workflow=args.workflow,
     ))
 
 

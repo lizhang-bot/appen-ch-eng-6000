@@ -1,4 +1,7 @@
-"""音频质检 pipeline：批量任务 → ISE+judge → 增量写 result/<code>.json。
+"""音频质检 pipeline：批量任务 → ISE+judge → 增量写 result/[<workflow>/]<code>.json。
+
+多工作流：传 --workflow A3244 则结果存 result/A3244/<code>.json，音频缓存也按工作流隔离
+（不同工作流的「编号」可能重复，必须隔离，否则结果文件 / 音频缓存会互相覆盖）。
 
 结果文件 schema:
 {
@@ -25,7 +28,8 @@
 }
 
 用法：
-    cat tasks.json | python qa_pipeline.py --code 6
+    python qa_pipeline.py --code 6 --workflow A3244 --from-result   # 评判 result/A3244/6.json
+    cat tasks.json | python qa_pipeline.py --code 6                  # 经典模式（flat 路径）
 """
 
 import argparse
@@ -47,6 +51,20 @@ AUDIO_CACHE = "audio_cache"
 RESULT_DIR = "result"
 os.makedirs(AUDIO_CACHE, exist_ok=True)
 os.makedirs(RESULT_DIR, exist_ok=True)
+
+
+def result_path(code: str, workflow: str = "") -> str:
+    """结果文件路径。指定 workflow 时按工作流分目录隔离（编号可能跨工作流重复）。"""
+    if workflow:
+        d = os.path.join(RESULT_DIR, workflow)
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"{code}.json")
+    return os.path.join(RESULT_DIR, f"{code}.json")
+
+
+def cache_key(code: str, workflow: str = "") -> str:
+    """audio_cache 文件名前缀，工作流隔离避免编号重复时音频串味。"""
+    return f"{workflow}_{code}" if workflow else str(code)
 
 
 # AI 给出的原始原因标签 → 备注用的类别（去重时按此分类）
@@ -130,7 +148,7 @@ def _build_detailed_comment(raw_reasons: list[tuple[str, str]]) -> str:
     return "; ".join(parts)
 
 
-def process_one(item: dict, code: str, retry: int = 1) -> dict:
+def process_one(item: dict, code: str, workflow: str = "", retry: int = 1) -> dict:
     """统一用 status 字段表示题目状态：
       - pending: 待评判（初始态）
       - pass: 评判通过
@@ -160,8 +178,9 @@ def process_one(item: dict, code: str, retry: int = 1) -> dict:
     last_err = None
     for attempt in range(retry + 1):
         try:
-            wav = f"{AUDIO_CACHE}/{code}_q{seq}.wav"
-            pcm = f"{AUDIO_CACHE}/{code}_q{seq}.pcm"
+            key = cache_key(code, workflow)
+            wav = f"{AUDIO_CACHE}/{key}_q{seq}.wav"
+            pcm = f"{AUDIO_CACHE}/{key}_q{seq}.pcm"
             download(data_url, wav)
             to_pcm(wav, pcm)
             root = evaluate(pcm, text, language=lang)
@@ -217,7 +236,7 @@ def save_result(path: str, doc: dict):
         json.dump(doc, f, ensure_ascii=False, indent=2)
 
 
-def _evaluate_pending(doc: dict, code: str, concurrency: int):
+def _evaluate_pending(doc: dict, code: str, workflow: str, concurrency: int):
     """对 doc.questions 中 status=='pending' 的题跑 ISE / 非音频题直接 skip。"""
     # 1. 非音频题直接标 skip（兼容历史数据：status=skip 但 comment 空也补上）
     skip_count = 0
@@ -245,7 +264,7 @@ def _evaluate_pending(doc: dict, code: str, concurrency: int):
         for q in pending:
             futs[ex.submit(process_one, {"seq": q["seq"],
                                           "dataUrl": q["dataUrl"],
-                                          "content": q["content"]}, code)] = q["seq"]
+                                          "content": q["content"]}, code, workflow)] = q["seq"]
         for fut in as_completed(futs):
             r = fut.result()
             target = next(q for q in doc["questions"] if q["seq"] == r["seq"])
@@ -261,26 +280,31 @@ def _evaluate_pending(doc: dict, code: str, concurrency: int):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--code", required=True, help="页面编号，用作结果文件名")
+    ap.add_argument("--workflow", default="",
+                    help="工作流 code（如 A3244）。指定后结果存 result/<workflow>/<code>.json，"
+                         "音频缓存也按工作流隔离（编号跨工作流可能重复）")
     ap.add_argument("--total", type=int, default=203, help="总题数")
     ap.add_argument("--task-id", default="2059511317494829071")
     ap.add_argument("--flow-id", default="2058728701937496080")
     ap.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                     help="ISE 并发数")
     ap.add_argument("--from-result", action="store_true",
-                    help="直接读 result/<code>.json 中所有 evaluated!=true 的题跑 ISE。"
+                    help="直接读 result/[<workflow>/]<code>.json 中所有 pending 的题跑 ISE。"
                          "不读 stdin。")
     args = ap.parse_args()
 
-    result_path = os.path.join(RESULT_DIR, f"{args.code}.json")
-    doc = load_result(result_path)
+    rpath = result_path(args.code, args.workflow)
+    doc = load_result(rpath)
     doc.setdefault("code", args.code)
+    if args.workflow:
+        doc.setdefault("workflow", args.workflow)
     doc.setdefault("taskId", args.task_id)
     doc.setdefault("flowId", args.flow_id)
     doc.setdefault("totalQuestions", args.total)
     doc.setdefault("questions", [])
 
     if args.from_result:
-        _evaluate_pending(doc, args.code, args.concurrency)
+        _evaluate_pending(doc, args.code, args.workflow, args.concurrency)
     else:
         # 经典模式：stdin 喂 (seq, dataUrl, content) 列表
         items = json.load(sys.stdin)
@@ -293,7 +317,8 @@ def main():
             print(f"并发 {args.concurrency} 跑 {len(pending)} 道...")
             results: list[dict] = []
             with ThreadPoolExecutor(max_workers=args.concurrency) as ex:
-                futures = {ex.submit(process_one, it, args.code): it["seq"] for it in pending}
+                futures = {ex.submit(process_one, it, args.code, args.workflow): it["seq"]
+                           for it in pending}
                 for fut in as_completed(futures):
                     r = fut.result()
                     r["dataUrl"] = next((it["dataUrl"] for it in pending if it["seq"] == r["seq"]), "")
@@ -304,9 +329,9 @@ def main():
 
     doc["questions"].sort(key=lambda q: q["seq"])
     doc["summary"] = build_summary(doc["questions"], args.total)
-    save_result(result_path, doc)
+    save_result(rpath, doc)
 
-    print(f"\n写入 {result_path}")
+    print(f"\n写入 {rpath}")
     print(f"  totalQuestions={doc['summary']['totalQuestions']}  "
           f"failedCount={doc['summary']['failedCount']}  "
           f"failReasons={doc['summary']['failReasons'] or '-'}")

@@ -183,18 +183,21 @@ def dingtalk(content: str) -> None:
         print(f"\n[钉钉] 发送异常：{e}")
 
 
-async def print_next_steps(page, url: str) -> None:
-    """抢到任务后打印后续流水线命令。"""
+async def print_next_steps(page, wf: dict) -> None:
+    """抢到任务后打印后续流水线命令（按工作流带上 --workflow，结果存 result/<workflow>/<编号>.json）。"""
     try:
         code = await page.evaluate(CODE_JS)
     except Exception:
         code = None
     c = code or "<编号>"
-    cur = page.url or url
+    cur = page.url or wf["url"]
+    wfc = wf.get("code") or ""
+    wf_arg = f" --workflow {wfc}" if wfc else ""
+    rp = f"result/{wfc}/{c}.json" if wfc else f"result/{c}.json"
     print("\n下一步流水线（编号 = 页面左下「编号：N」）：")
-    print(f"  1) 抓题:  python tools/collect_via_playwright.py {c} --url \"{cur}\" --interval 200")
-    print(f"  2) 评判:  python qa_pipeline.py --code {c} --from-result --concurrency 10")
-    print(f"  3) 标注:  回到 Claude 会话说「用 mark-tasks 根据 result/{c}.json 在页面标注」")
+    print(f"  1) 抓题:  python tools/collect_via_playwright.py {c}{wf_arg} --url \"{cur}\" --interval 200")
+    print(f"  2) 评判:  python qa_pipeline.py --code {c}{wf_arg} --from-result --concurrency 10")
+    print(f"  3) 标注:  回到 Claude 会话说「用 mark-tasks 根据 {rp} 在页面标注」")
     if not code:
         print("  （没自动读到编号，请看页面左下角「编号：N」手动替换上面的 <编号>）")
 
@@ -245,7 +248,7 @@ async def worker(idx: int, page, wf: dict, interval: float,
                     dingtalk(f"Appen 抢任务报告\n[{label}] 已抢到任务（第 {n} 次尝试，"
                              f"用时 {elapsed:.1f}s），请尽快进入质检。\n{wf['url']}")
                     await page.goto(wf["url"], wait_until="domcontentloaded", timeout=30000)
-                    await print_next_steps(page, wf["url"])
+                    await print_next_steps(page, wf)
             state.done.set()
             break
         else:
