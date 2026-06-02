@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -133,8 +134,14 @@ async def collect(code: str, url: str, total: int, interval_ms: int, headless: b
     data_lines: list[str] = []
     error_lines: list[str] = []
 
+    if not headless and sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        headless = True
+        print("（Linux 无 DISPLAY，自动切 headless 模式）")
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
+        browser = await p.chromium.launch(
+            headless=headless, args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
         ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "

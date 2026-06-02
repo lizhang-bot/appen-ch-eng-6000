@@ -4,7 +4,6 @@ __pycache__/
 .venv/
 .DS_Store
 audio_cache/
-watch_jobs.sh
 .claude
 venv
 
